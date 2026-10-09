@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/cian-watch
+
+jobs:
+  quality:
+    name: lint and types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --frozen
+
+      - name: Ruff
+        run: |
+          uv run ruff check cian_watch config
+          uv run ruff format --check cian_watch config
+
+      - name: Mypy
+        run: uv run mypy --strict cian_watch config
+
+  # Публикуем только с main и только после зелёного гейта: на сервер не должен
+  # попасть образ, не прошедший линт и типы.
+  publish:
+    name: build and push image
+    needs: quality
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Два тега: latest для обычной выкатки, sha для отката на конкретный коммит.
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Выкатка. Ключ и отпечаток сервера лежат в секретах репозитория, .env и compose
+  # уже лежат на сервере (sync-server.sh), CI их не видит.
+  deploy:
+    name: deploy to gazziiii777
+    needs: publish
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prepare ssh
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Deploy
+        run: |
+          ssh -p ${{ secrets.DEPLOY_PORT }} ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} '
+            set -e
+            cd ~/apps/cian-watch
+            docker compose pull cian-watch
+            docker compose up -d
+            docker image prune -f
+            docker compose ps
+          '

@@ -1,0 +1,45 @@
+name: cian-watch
+
+networks:
+  cian:
+
+volumes:
+  cian-watch-db:
+
+services:
+  db:
+    image: postgres:17
+    container_name: cian-watch-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: cian
+      POSTGRES_PASSWORD: ${CIAN_DB_PASSWORD}
+      POSTGRES_DB: cian
+    volumes:
+      - cian-watch-db:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5433:5432"
+    networks: [cian]
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cian -d cian"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  cian-watch:
+    build: .
+    image: ghcr.io/gazziiii777/cian-watch:${IMAGE_TAG:-latest}
+    container_name: cian-watch
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      CIAN_DB_HOST: db
+      CIAN_DB_PORT: "5432"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [cian]
+    shm_size: 1g
+    init: true

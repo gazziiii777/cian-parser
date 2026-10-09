@@ -192,6 +192,23 @@ docker compose up --build
 Настройки читаются в таком порядке: переменные окружения, потом `.env`, потом дефолты
 из `config/settings.py`.
 
+## Деплой на gazziiii777
+
+Схема из заметки «Деплой через GitHub Actions» в Obsidian: пуш в `main` запускает
+`.github/workflows/ci.yml`: ruff и mypy, затем сборка образа `ghcr.io/gazziiii777/cian-watch`
+(теги `latest` и `sha-<коммит>`), затем по ssh на сервере `docker compose pull` и `up -d`.
+Образ собирается на раннере под amd64, на маке ничего собирать не нужно.
+
+CI видит только код. `compose.yaml` и `.env` лежат на сервере в `~/apps/cian-watch/`,
+туда их кладёт `./sync-server.sh` (запускать после правки `.env` или compose, потом
+`docker compose up -d` на сервере). Секреты репозитория: `DEPLOY_HOST`, `DEPLOY_PORT`,
+`DEPLOY_USER`, `DEPLOY_KEY` (приватный ключ `~/.ssh/eltk_site_gazzi`, его публичная часть
+уже на сервере), `DEPLOY_KNOWN_HOSTS` (`ssh-keyscan -p 2216 77.37.238.72`).
+
+Откат: на сервере `echo "IMAGE_TAG=sha-abc1234" >> .env && docker compose up -d`,
+вернуться на свежее: убрать строку и повторить. База живёт в томе `cian-watch-db`,
+выкатка её не трогает, миграции применяются при старте.
+
 ## Переменные окружения
 
 | Переменная | По умолчанию | Смысл |
