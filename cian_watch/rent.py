@@ -3,7 +3,7 @@ import statistics
 from typing import Any, ClassVar
 
 from cian_watch.cian_search import CianSearch
-from cian_watch.models import Offer, RentEstimate
+from cian_watch.models import Offer, OfferFacts, RentEstimate
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +29,7 @@ class RentEstimator:
     def __init__(self, cian: CianSearch) -> None:
         self._cian = cian
 
-    async def estimate(self, offer: Offer) -> RentEstimate | None:
+    async def estimate(self, offer: OfferFacts) -> RentEstimate | None:
         """None, если ни в доме, ни рядом, ни в районе нет похожих квартир в аренду."""
         candidates: list[tuple[str, dict[str, Any] | None, int]] = [
             (self.SCOPE_HOUSE, self._house_query(offer=offer), self.MIN_SAMPLE_HOUSE),
@@ -57,17 +57,16 @@ class RentEstimator:
             max_rent=rents[-1],
         )
 
-    def _house_query(self, offer: Offer) -> dict[str, Any] | None:
-        house = offer.geo.house()
-        if house is None:
+    def _house_query(self, offer: OfferFacts) -> dict[str, Any] | None:
+        if offer.house_id is None:
             return None
-        house_geo = {"type": "geo", "value": [{"type": "house", "id": house.id}]}
+        house_geo = {"type": "geo", "value": [{"type": "house", "id": offer.house_id}]}
         return {**self.base_query(offer=offer), "geo": house_geo}
 
-    def _nearby_query(self, offer: Offer) -> dict[str, Any] | None:
-        if offer.geo.coordinates is None:
+    def _nearby_query(self, offer: OfferFacts) -> dict[str, Any] | None:
+        if offer.lat is None or offer.lng is None:
             return None
-        lat, lng = offer.geo.coordinates.lat, offer.geo.coordinates.lng
+        lat, lng = offer.lat, offer.lng
         d_lat = self.RADIUS_KM / self.KM_PER_DEGREE_LAT
         d_lng = self.RADIUS_KM / self.KM_PER_DEGREE_LNG_MOSCOW
         corners = [
@@ -80,20 +79,18 @@ class RentEstimator:
         polygon = {"type": "polygon", "name": "nearby", "coordinates": [[str(x), str(y)] for x, y in corners]}
         return {**self.base_query(offer=offer), "geo": {"type": "geo", "value": [polygon]}}
 
-    def _district_query(self, offer: Offer) -> dict[str, Any] | None:
-        raion = offer.geo.raion()
-        if raion is None:
+    def _district_query(self, offer: OfferFacts) -> dict[str, Any] | None:
+        if offer.raion_id is None:
             return None
-        return CianSearch.with_district(self.base_query(offer=offer), raion.id)
+        return CianSearch.with_district(self.base_query(offer=offer), offer.raion_id)
 
-    def _district_scope(self, offer: Offer) -> str:
-        raion = offer.geo.raion()
-        return f"район {raion.name}" if raion else "район"
+    def _district_scope(self, offer: OfferFacts) -> str:
+        return f"район {offer.raion_name}" if offer.raion_name else "район"
 
-    def base_query(self, offer: Offer) -> dict[str, Any]:
+    def base_query(self, offer: OfferFacts) -> dict[str, Any]:
         """Долгосрочная аренда с теми же комнатами и площадью ±допуск. Цифры в полигоне
         отправляются строками там, где так делает сам сайт: иначе API полигон игнорирует."""
-        rooms = offer.rooms_count if offer.rooms_count is not None else self.STUDIO_ROOM_CODE
+        rooms = offer.rooms if offer.rooms is not None else self.STUDIO_ROOM_CODE
         return {
             **self.district_base_query(),
             "room": {"type": "terms", "value": [rooms]},

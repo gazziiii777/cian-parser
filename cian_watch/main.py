@@ -34,6 +34,7 @@ from cian_watch.models import (
     DomclickEstimate,
     EstimationOutcome,
     Offer,
+    OfferFacts,
     PollReport,
     PriceChange,
     RentedStats,
@@ -56,6 +57,7 @@ class _Defaults:
     ESTIMATE_ATTEMPTS: int = 2
     ESTIMATE_RETRY_PAUSE_SECONDS: float = 2.0
     NOTIFY_MAX_NEW_PER_POLL: int = 40
+    BACKFILL_BATCH: int = 40
     RENTED_STATS_DAYS: int = 30
     RENTED_STATS_MIN_COUNT: int = 3
     SWEEP_IDLE_SECONDS: float = 60.0
@@ -183,6 +185,7 @@ async def _feed_loop(
             catch_up=catch_up,
         )
         catch_up = catch_up and not recorded
+        await _backfill_estimates(scrapers=scrapers, repository=repository)
         await asyncio.sleep(_next_pause(settings=settings))
 
 
@@ -217,12 +220,14 @@ async def _poll_feed(
         if quiet:
             return True
         new_ids = {offer.id for offer in report.new_offers}
-        candidates = [offer for offer in offers if offer.id in new_ids or offer.id in awaiting_estimate]
+        candidates = [
+            offer.facts() for offer in offers if offer.id in new_ids or offer.id in awaiting_estimate
+        ]
         outcome = await _estimate_pending(
             offers=candidates, domclick=scrapers.domclick, repository=repository
         )
         rents = await _estimate_rent(
-            offers=report.new_offers,
+            offers=[offer.facts() for offer in report.new_offers],
             rent_estimator=RentEstimator(cian=scrapers.feed),
             repository=repository,
         )
@@ -476,8 +481,29 @@ async def _alert_watchers(
         await notifier.notify_gone(row=row, chat_ids=watchers[row.id])
 
 
+async def _backfill_estimates(scrapers: _Scrapers, repository: OffersRepository) -> None:
+    """Досчёт Домклика и аренды для объявлений, попавших в базу без оценок (тихий проход,
+    обход района): пачка между проходами ленты, теми же контекстами, что и лента. Сбои
+    оценщиков гасятся внутри, следующая пачка возьмёт то, что не досчиталось."""
+    pending = await repository.offers_to_backfill(limit=_Defaults.BACKFILL_BATCH)
+    if not pending:
+        return
+    started = time.monotonic()
+    outcome = await _estimate_pending(offers=pending, domclick=scrapers.domclick, repository=repository)
+    rents = await _estimate_rent(
+        offers=pending, rent_estimator=RentEstimator(cian=scrapers.feed), repository=repository
+    )
+    logger.info(
+        "backfill: %d offers, %d domclick estimates, %d rent estimates in %.0fs",
+        len(pending),
+        len(outcome.estimates),
+        len(rents),
+        time.monotonic() - started,
+    )
+
+
 async def _estimate_pending(
-    offers: list[Offer], domclick: DomclickEstimator, repository: OffersRepository
+    offers: list[OfferFacts], domclick: DomclickEstimator, repository: OffersRepository
 ) -> EstimationOutcome:
     """Оценивает объявления выдачи без строки в domclick_estimates, с паузой между запросами,
     чтобы Qrator не счёл это атакой. Ненайденный адрес записывается как ошибка и больше
@@ -505,7 +531,7 @@ async def _estimate_pending(
     return outcome
 
 
-async def _estimate_with_retry(domclick: DomclickEstimator, offer: Offer) -> DomclickEstimate | None:
+async def _estimate_with_retry(domclick: DomclickEstimator, offer: OfferFacts) -> DomclickEstimate | None:
     """Таймаут, обрыв или 5xx от Домклика лечатся переоткрытием его контекста (новые куки Qrator)
     и одним повтором. Ненайденный адрес не повторяется и уходит наверх."""
     for attempt in range(1, _Defaults.ESTIMATE_ATTEMPTS + 1):
@@ -579,10 +605,11 @@ async def _rented_stats(offer: Offer, repository: OffersRepository) -> RentedSta
 
 
 async def _estimate_rent(
-    offers: list[Offer], rent_estimator: RentEstimator, repository: OffersRepository
+    offers: list[OfferFacts], rent_estimator: RentEstimator, repository: OffersRepository
 ) -> dict[int, RentEstimate]:
-    """Аренда похожих квартир вокруг каждого нового объявления, по два запроса к API Циана
-    максимум. Сбой выдачи здесь не роняет проход: аренда вторична, объявление уйдёт без неё."""
+    """Аренда похожих квартир вокруг каждого объявления без оценки, до трёх запросов к API
+    Циана на штуку. Пустой результат тоже записывается, чтобы не искать заново. Сбой выдачи
+    здесь не роняет проход: аренда вторична, объявление уйдёт без неё."""
     rents: dict[int, RentEstimate] = {}
     pending = await repository.offers_without_rent(offers=offers, limit=_Defaults.ESTIMATES_PER_POLL)
     for offer in pending:
@@ -593,6 +620,7 @@ async def _estimate_rent(
             break
         if rent is None:
             logger.info("no rent comparables for offer %s", offer.id)
+            await repository.save_rent_missing(offer_id=offer.id, estimated_at=datetime.now(UTC))
             continue
         await repository.save_rent(rent=rent, estimated_at=datetime.now(UTC))
         rents[offer.id] = rent
@@ -607,7 +635,7 @@ async def _estimate_rent(
     return rents
 
 
-def _print_estimate(offer: Offer, estimate: DomclickEstimate) -> None:
+def _print_estimate(offer: OfferFacts, estimate: DomclickEstimate) -> None:
     gap_percent = (offer.price - estimate.market_price) / estimate.market_price * 100
     logger.info(
         "DOMCLICK %s (%s - %s) | cian %s, %+.0f%% to market | %s | %s",

@@ -38,7 +38,7 @@ class CatalogItem:
         return (self.offer.price - self.first_price) / self.first_price * 100
 
     def payback_years(self) -> float | None:
-        if self.rent is None:
+        if self.rent is None or self.rent.sample_size == 0:
             return None
         return self.offer.price / (self.rent.median_rent * 12)
 
@@ -145,7 +145,7 @@ class CatalogRepository:
             )
         query = query.where(OfferRow.status == OfferStatus.ACTIVE, ~hidden_by_me)
         if scope is CatalogScope.PAYBACK:
-            return query.where(RentEstimateRow.median_rent.is_not(None)).order_by(
+            return query.where(RentEstimateRow.sample_size > 0).order_by(
                 (OfferRow.price / RentEstimateRow.median_rent).asc(), OfferRow.cian_created_at.desc()
             )
         return query.order_by(OfferRow.cian_created_at.desc())

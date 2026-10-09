@@ -13,7 +13,15 @@ from cian_watch.db.tables import (
     PriceHistoryRow,
     RentEstimateRow,
 )
-from cian_watch.models import DomclickEstimate, Offer, PollReport, PriceChange, RentedStats, RentEstimate
+from cian_watch.models import (
+    DomclickEstimate,
+    Offer,
+    OfferFacts,
+    PollReport,
+    PriceChange,
+    RentedStats,
+    RentEstimate,
+)
 
 
 class OffersRepository:
@@ -63,6 +71,11 @@ class OffersRepository:
                 if row.raion_id is None and (raion := offer.geo.raion()) is not None:
                     row.raion_id = raion.id
                     row.raion_name = raion.name
+                if row.lat is None and offer.geo.coordinates is not None:
+                    row.lat = offer.geo.coordinates.lat
+                    row.lng = offer.geo.coordinates.lng
+                if row.floor is None:
+                    row.floor = offer.floor_number
             if history:
                 await session.execute(insert(PriceHistoryRow), history)
         return report
@@ -151,7 +164,43 @@ class OffersRepository:
                     gone.append(row.id)
             return gone
 
-    async def offers_without_estimate(self, offers: list[Offer], limit: int) -> list[Offer]:
+    async def offers_to_backfill(self, limit: int) -> list[OfferFacts]:
+        """Активные объявления продажи без оценки Домклика или аренды: попали в базу тихим
+        проходом или обходом района. Свежее увиденные первыми: у них уже есть координаты и этаж."""
+        async with self._sessions() as session:
+            rows = await session.execute(
+                select(OfferRow)
+                .outerjoin(DomclickEstimateRow, DomclickEstimateRow.offer_id == OfferRow.id)
+                .outerjoin(RentEstimateRow, RentEstimateRow.offer_id == OfferRow.id)
+                .where(
+                    OfferRow.deal_type == DealType.SALE,
+                    OfferRow.status == OfferStatus.ACTIVE,
+                    OfferRow.total_area.is_not(None),
+                    (DomclickEstimateRow.offer_id.is_(None)) | (RentEstimateRow.offer_id.is_(None)),
+                )
+                .order_by(OfferRow.last_seen_at.desc())
+                .limit(limit)
+            )
+            return [self._facts(row=row) for row in rows.scalars()]
+
+    @staticmethod
+    def _facts(row: OfferRow) -> OfferFacts:
+        return OfferFacts(
+            id=row.id,
+            url=row.url,
+            price=row.price,
+            address=row.address,
+            total_area=row.total_area or 0.0,
+            rooms=row.rooms,
+            floor=row.floor,
+            house_id=row.house_id,
+            lat=row.lat,
+            lng=row.lng,
+            raion_id=row.raion_id,
+            raion_name=row.raion_name,
+        )
+
+    async def offers_without_estimate(self, offers: list[OfferFacts], limit: int) -> list[OfferFacts]:
         """Оставляет объявления без строки в domclick_estimates: ни оценки, ни зафиксированной
         ошибки адреса."""
         async with self._sessions() as session:
@@ -191,7 +240,7 @@ class OffersRepository:
             estimated_at=estimated_at,
         )
 
-    async def offers_without_rent(self, offers: list[Offer], limit: int) -> list[Offer]:
+    async def offers_without_rent(self, offers: list[OfferFacts], limit: int) -> list[OfferFacts]:
         async with self._sessions() as session:
             estimated = await session.execute(
                 select(RentEstimateRow.offer_id).where(
@@ -200,6 +249,16 @@ class OffersRepository:
             )
             done = set(estimated.scalars())
         return [offer for offer in offers if offer.id not in done][:limit]
+
+    async def save_rent_missing(self, offer_id: int, estimated_at: datetime) -> None:
+        """Похожих в аренду не нашлось ни в доме, ни рядом, ни в районе: строка с нулевой
+        выборкой, чтобы объявление не проверялось заново каждым досчётом."""
+        await self.save_rent(
+            rent=RentEstimate(
+                offer_id=offer_id, scope="", sample_size=0, median_rent=0, min_rent=0, max_rent=0
+            ),
+            estimated_at=estimated_at,
+        )
 
     async def save_rent(self, rent: RentEstimate, estimated_at: datetime) -> None:
         values = {
@@ -255,4 +314,7 @@ class OffersRepository:
             house_id=house.id if house else None,
             rooms=offer.rooms_count,
             total_area=offer.total_area,
+            lat=offer.geo.coordinates.lat if offer.geo.coordinates else None,
+            lng=offer.geo.coordinates.lng if offer.geo.coordinates else None,
+            floor=offer.floor_number,
         )

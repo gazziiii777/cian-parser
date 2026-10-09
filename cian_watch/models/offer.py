@@ -5,6 +5,8 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic.alias_generators import to_camel
 
+from cian_watch.models.offer_facts import OfferFacts
+
 
 class OfferCoordinates(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -83,3 +85,21 @@ class Offer(BaseModel):
     @property
     def price(self) -> int:
         return self.bargain_terms.price
+
+    def facts(self) -> OfferFacts:
+        raion = self.geo.raion()
+        house = self.geo.house()
+        return OfferFacts(
+            id=self.id,
+            url=self.url,
+            price=self.price,
+            address=self.geo.user_input,
+            total_area=self.total_area,
+            rooms=self.rooms_count,
+            floor=self.floor_number,
+            house_id=house.id if house else None,
+            lat=self.geo.coordinates.lat if self.geo.coordinates else None,
+            lng=self.geo.coordinates.lng if self.geo.coordinates else None,
+            raion_id=raion.id if raion else None,
+            raion_name=raion.name if raion else None,
+        )

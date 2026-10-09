@@ -4,6 +4,7 @@ from cian_watch.models.domclick import (
     DomclickSuggestResponse,
 )
 from cian_watch.models.offer import Offer
+from cian_watch.models.offer_facts import OfferFacts
 from cian_watch.models.poll_report import EstimationOutcome, PollReport, PriceChange
 from cian_watch.models.rent import RentedStats, RentEstimate
 from cian_watch.models.search_api import PageFetchResult, SearchApiResponse
@@ -17,6 +18,7 @@ __all__ = [
     "EstimationOutcome",
     "InitialState",
     "Offer",
+    "OfferFacts",
     "PageFetchResult",
     "PollReport",
     "PriceChange",

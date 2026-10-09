@@ -54,6 +54,9 @@ class OfferRow(Base):
     house_id: Mapped[int | None] = mapped_column(BigInteger)
     rooms: Mapped[int | None] = mapped_column(Integer)
     total_area: Mapped[float | None] = mapped_column(Float)
+    lat: Mapped[float | None] = mapped_column(Float)
+    lng: Mapped[float | None] = mapped_column(Float)
+    floor: Mapped[int | None] = mapped_column(Integer)
 
 
 class PriceHistoryRow(Base):

@@ -9,7 +9,7 @@ from pydantic import BaseModel, ValidationError
 
 from cian_watch.browser import BrowserHost
 from cian_watch.exceptions import DomclickAddressNotFound, DomclickError, DomclickNoPrediction
-from cian_watch.models import DomclickEstimate, DomclickPredictResponse, DomclickSuggestResponse, Offer
+from cian_watch.models import DomclickEstimate, DomclickPredictResponse, DomclickSuggestResponse, OfferFacts
 from config.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -74,13 +74,13 @@ class DomclickEstimator:
         self._context = None
         self._page = None
 
-    async def estimate(self, offer: Offer) -> DomclickEstimate:
+    async def estimate(self, offer: OfferFacts) -> DomclickEstimate:
         """Подсказка адреса, затем predict. Если Qrator перестал пускать (401), страница
         открывается заново один раз и запрос повторяется."""
-        if offer.geo.user_input is None:
+        if offer.address is None:
             raise DomclickAddressNotFound(f"offer {offer.id} has no address")
         await self.ensure_open()
-        query = offer.geo.user_input.removeprefix(self.COUNTRY_PREFIX)
+        query = offer.address.removeprefix(self.COUNTRY_PREFIX)
         suggest = await self._get_json(
             url=f"{self.SUGGEST_URL}?{urlencode({'query': query})}",
             model=DomclickSuggestResponse,
@@ -107,16 +107,16 @@ class DomclickEstimator:
             url=f"{self.HOME_URL}?{urlencode(params)}",
         )
 
-    def _predict_params(self, offer: Offer, house_guid: str) -> dict[str, str | int | float]:
+    def _predict_params(self, offer: OfferFacts, house_guid: str) -> dict[str, str | int | float]:
         params: dict[str, str | int | float] = {
             "guid": house_guid,
             "comm_sq": offer.total_area,
             "quality": self.REPAIR_QUALITY,
         }
-        if offer.rooms_count is not None:
-            params["rooms"] = offer.rooms_count
-        if offer.floor_number is not None:
-            params["floor"] = offer.floor_number
+        if offer.rooms is not None:
+            params["rooms"] = offer.rooms
+        if offer.floor is not None:
+            params["floor"] = offer.floor
         return params
 
     async def _get_json[T: BaseModel](self, url: str, model: type[T]) -> T:

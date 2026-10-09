@@ -1,7 +1,13 @@
 name: cian-watch
 
+# graylog: сеть стека Graylog на gazziiii777. Порт 12201 опубликован на адресе локальной сети,
+# а трафик между docker-сетями одного хоста Docker режет, поэтому парсер шлёт логи напрямую
+# в контейнер graylog по его сети. Локально (uv run) эта сеть не нужна.
 networks:
   cian:
+  graylog:
+    name: graylog_graylog
+    external: true
 
 volumes:
   cian-watch-db:
@@ -37,9 +43,10 @@ services:
     environment:
       CIAN_DB_HOST: db
       CIAN_DB_PORT: "5432"
+      CIAN_GELF_HOST: graylog
     depends_on:
       db:
         condition: service_healthy
-    networks: [cian]
+    networks: [cian, graylog]
     shm_size: 1g
     init: true
