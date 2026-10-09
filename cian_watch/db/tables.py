@@ -1,7 +1,18 @@
 from datetime import datetime
 from enum import StrEnum
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Identity, Index, Integer, Text
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Identity,
+    Index,
+    Integer,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -93,4 +104,31 @@ class UserRow(Base):
     telegram_chat_id: Mapped[int] = mapped_column(BigInteger, unique=True)
     name: Mapped[str] = mapped_column(Text)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class WatchlistRow(Base):
+    __tablename__ = "watchlist"
+    __table_args__ = (
+        UniqueConstraint("telegram_chat_id", "offer_id", name="uq_watchlist_chat_offer"),
+        Index("ix_watchlist_offer", "offer_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    telegram_chat_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.telegram_chat_id", ondelete="CASCADE")
+    )
+    offer_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("offers.id", ondelete="CASCADE"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class HiddenRow(Base):
+    __tablename__ = "hidden"
+    __table_args__ = (UniqueConstraint("telegram_chat_id", "offer_id", name="uq_hidden_chat_offer"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    telegram_chat_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.telegram_chat_id", ondelete="CASCADE")
+    )
+    offer_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("offers.id", ondelete="CASCADE"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

@@ -9,14 +9,17 @@ from datetime import UTC, datetime, timedelta
 from functools import partial
 
 from playwright.async_api import Error as PlaywrightError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cian_watch.browser import BrowserHost
 from cian_watch.cian_search import CianSearch
+from cian_watch.db.catalog import CatalogRepository
 from cian_watch.db.engine import create_engine, create_sessions
 from cian_watch.db.migrations import apply_migrations
 from cian_watch.db.repository import OffersRepository
 from cian_watch.db.tables import DealType
 from cian_watch.db.users import UsersRepository
+from cian_watch.db.watchlist import WatchlistRepository
 from cian_watch.domclick import DomclickEstimator
 from cian_watch.exceptions import (
     BlockedError,
@@ -25,6 +28,7 @@ from cian_watch.exceptions import (
     DomclickNoPrediction,
     SerpParseError,
 )
+from cian_watch.formatting import rubles
 from cian_watch.logs import configure_logging
 from cian_watch.models import (
     DomclickEstimate,
@@ -38,6 +42,8 @@ from cian_watch.models import (
 from cian_watch.proxy_rotation import ProxyRotator
 from cian_watch.rent import RentEstimator
 from cian_watch.telegram import TelegramNotifier
+from cian_watch.telegram_api import TelegramApi
+from cian_watch.telegram_bot import TelegramBot
 from config.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -81,16 +87,30 @@ class _Scrapers:
             await self.host.restart()
 
 
+@dataclass
+class _Telegram:
+    """Исходящая и входящая стороны одного бота поверх общего API-клиента."""
+
+    notifier: TelegramNotifier
+    bot: TelegramBot
+
+
 async def watch(settings: Settings) -> None:
     """Поднимает базу (миграции до head), Telegram (если задан) и браузер, затем запускает
-    три параллельные задачи до остановки процесса: ленту новых, обход продажи, обход аренды."""
+    параллельные задачи до остановки процесса: ленту новых, обход продажи, обход аренды
+    и, при включённом Telegram, опрос апдейтов бота."""
     engine = create_engine(settings=settings)
     try:
         await apply_migrations(engine=engine)
-        repository = OffersRepository(sessions=create_sessions(engine=engine))
+        sessions = create_sessions(engine=engine)
+        repository = OffersRepository(sessions=sessions)
+        watchlist = WatchlistRepository(sessions=sessions)
         async with AsyncExitStack() as stack:
-            users = UsersRepository(sessions=create_sessions(engine=engine))
-            notifier = await _open_notifier(settings=settings, stack=stack, users=users)
+            users = UsersRepository(sessions=sessions)
+            telegram = await _open_telegram(
+                settings=settings, stack=stack, sessions=sessions, users=users, watchlist=watchlist
+            )
+            notifier = telegram.notifier if telegram is not None else None
             host = await stack.enter_async_context(BrowserHost(settings))
             proxy = settings.proxy()
             session_lock = asyncio.Lock()
@@ -103,17 +123,27 @@ async def watch(settings: Settings) -> None:
                 rotator=ProxyRotator(rotate_url=proxy.rotate_url) if proxy and proxy.rotate_url else None,
             )
             async with asyncio.TaskGroup() as tasks:
-                tasks.create_task(_feed_loop(settings, scrapers, repository, notifier))
-                tasks.create_task(_sweep_loop(settings, scrapers, repository, notifier, DealType.SALE))
-                tasks.create_task(_sweep_loop(settings, scrapers, repository, notifier, DealType.RENT))
+                tasks.create_task(_feed_loop(settings, scrapers, repository, notifier, watchlist))
+                tasks.create_task(
+                    _sweep_loop(settings, scrapers, repository, notifier, watchlist, DealType.SALE)
+                )
+                tasks.create_task(
+                    _sweep_loop(settings, scrapers, repository, notifier, watchlist, DealType.RENT)
+                )
+                if telegram is not None:
+                    tasks.create_task(telegram.bot.run())
     finally:
         await engine.dispose()
 
 
-async def _open_notifier(
-    settings: Settings, stack: AsyncExitStack, users: UsersRepository
-) -> TelegramNotifier | None:
-    """Без токена уведомления выключены. chat_id из настроек это владелец: он заводится
+async def _open_telegram(
+    settings: Settings,
+    stack: AsyncExitStack,
+    sessions: async_sessionmaker[AsyncSession],
+    users: UsersRepository,
+    watchlist: WatchlistRepository,
+) -> _Telegram | None:
+    """Без токена Telegram выключен целиком. chat_id из настроек это владелец: он заводится
     в users при старте, остальные выдаются командой cian-watch-users."""
     if settings.telegram_bot_token is None:
         logger.info("telegram is off: set CIAN_TELEGRAM_BOT_TOKEN to enable")
@@ -122,12 +152,15 @@ async def _open_notifier(
         await users.grant(
             telegram_chat_id=settings.telegram_chat_id, name="owner", created_at=datetime.now(UTC)
         )
-    notifier = TelegramNotifier(
-        bot_token=settings.telegram_bot_token,
-        recipients=users.active_chat_ids,
-        proxy=settings.telegram_proxy,
+    api = await stack.enter_async_context(
+        TelegramApi(bot_token=settings.telegram_bot_token, proxy=settings.telegram_proxy)
     )
-    return await stack.enter_async_context(notifier)
+    return _Telegram(
+        notifier=TelegramNotifier(api=api, recipients=users.active_chat_ids),
+        bot=TelegramBot(
+            api=api, users=users, watchlist=watchlist, catalog=CatalogRepository(sessions=sessions)
+        ),
+    )
 
 
 async def _feed_loop(
@@ -135,16 +168,21 @@ async def _feed_loop(
     scrapers: _Scrapers,
     repository: OffersRepository,
     notifier: TelegramNotifier | None,
+    watchlist: WatchlistRepository,
 ) -> None:
     awaiting_estimate: set[int] = set()
+    catch_up = True
     while True:
-        await _poll_feed(
+        recorded = await _poll_feed(
             settings=settings,
             scrapers=scrapers,
             repository=repository,
             notifier=notifier,
+            watchlist=watchlist,
             awaiting_estimate=awaiting_estimate,
+            catch_up=catch_up,
         )
+        catch_up = catch_up and not recorded
         await asyncio.sleep(_next_pause(settings=settings))
 
 
@@ -153,17 +191,20 @@ async def _poll_feed(
     scrapers: _Scrapers,
     repository: OffersRepository,
     notifier: TelegramNotifier | None,
+    watchlist: WatchlistRepository,
     awaiting_estimate: set[int],
-) -> None:
+    catch_up: bool,
+) -> bool:
     """Один проход ленты: новые объявления (с ранней остановкой), запись в базу, оценки Домклика
-    и аренды для новых, уведомления. Пустая база только заполняется. Пачка новых больше порога
-    (первый обход, простой парсера) тоже только пишется: иначе в Telegram улетят сотни сообщений.
+    и аренды для новых, уведомления. Первый проход после старта (catch_up) и пачка новых больше
+    порога (простой парсера) только пишутся в базу: иначе после каждого перезапуска в Telegram
+    улетает всё, что накопилось. Возвращает, дошёл ли проход до записи в базу: тихий проход
+    засчитывается только тогда.
     Оцениваются только новые объявления этого прохода и те, что ушли в Telegram без оценки
     раньше (awaiting_estimate). Если лента не открылась даже после перезапусков или браузер
     упал, проход пропускается."""
     generation = scrapers.host.generation
     try:
-        seeding = await repository.is_empty()
         offers = await _with_browser_retries(
             settings=settings,
             scrapers=scrapers,
@@ -171,10 +212,10 @@ async def _poll_feed(
             action=partial(_fetch_feed, settings=settings, scrapers=scrapers, repository=repository),
         )
         report = await repository.record(offers=offers, seen_at=datetime.now(UTC))
-        quiet = seeding or len(report.new_offers) > _Defaults.NOTIFY_MAX_NEW_PER_POLL
+        quiet = catch_up or len(report.new_offers) > _Defaults.NOTIFY_MAX_NEW_PER_POLL
         _print_report(report=report, offers_total=len(offers), quiet=quiet)
         if quiet:
-            return
+            return True
         new_ids = {offer.id for offer in report.new_offers}
         candidates = [offer for offer in offers if offer.id in new_ids or offer.id in awaiting_estimate]
         outcome = await _estimate_pending(
@@ -193,14 +234,17 @@ async def _poll_feed(
                 outcome=outcome,
                 rents=rents,
                 awaiting=awaiting_estimate,
-                min_drop_percent=settings.price_drop_alert_percent,
                 repository=repository,
+                watchlist=watchlist,
             )
     except SerpParseError:
         logger.exception("feed could not be parsed, skipping this poll")
+        return False
     except (BlockedError, PlaywrightError):
         logger.exception("feed browser path failed, relaunching and skipping this poll")
         await scrapers.relaunch(rotate_ip=True, seen_generation=generation)
+        return False
+    return True
 
 
 async def _sweep_loop(
@@ -208,6 +252,7 @@ async def _sweep_loop(
     scrapers: _Scrapers,
     repository: OffersRepository,
     notifier: TelegramNotifier | None,
+    watchlist: WatchlistRepository,
     deal_type: DealType,
 ) -> None:
     """Непрерывный обход районов с активными объявлениями по одному типу сделки: район
@@ -231,6 +276,7 @@ async def _sweep_loop(
                 scrapers=scrapers,
                 repository=repository,
                 notifier=notifier,
+                watchlist=watchlist,
                 raion_id=raion_id,
                 deal_type=deal_type,
             )
@@ -243,6 +289,7 @@ async def _sweep_district_safely(
     scrapers: _Scrapers,
     repository: OffersRepository,
     notifier: TelegramNotifier | None,
+    watchlist: WatchlistRepository,
     raion_id: int,
     deal_type: DealType,
 ) -> None:
@@ -253,6 +300,7 @@ async def _sweep_district_safely(
             scrapers=scrapers,
             repository=repository,
             notifier=notifier,
+            watchlist=watchlist,
             raion_id=raion_id,
             deal_type=deal_type,
         )
@@ -321,11 +369,13 @@ async def _sweep_district(
     scrapers: _Scrapers,
     repository: OffersRepository,
     notifier: TelegramNotifier | None,
+    watchlist: WatchlistRepository,
     raion_id: int,
     deal_type: DealType,
 ) -> None:
     """Район целиком по одному типу сделки: продажа по фильтру из настроек, аренда вся
-    долгосрочная. Цены обновляются, снижение продажи уходит в Telegram, пропавшие помечаются."""
+    долгосрочная. Цены обновляются, пропавшие помечаются; по продаже наблюдатели объявления
+    получают изменение цены, снятие и возвращение."""
     started = time.monotonic()
     if deal_type is DealType.SALE:
         cian = scrapers.sale
@@ -360,9 +410,9 @@ async def _sweep_district(
     for change in report.price_changes:
         _print_price_change(change=change)
     if notifier is not None:
-        for change in report.price_changes:
-            if change.drop_percent() >= settings.price_drop_alert_percent:
-                await notifier.notify_price_change(change=change)
+        await _alert_watchers(
+            notifier=notifier, watchlist=watchlist, repository=repository, report=report, gone_ids=gone
+        )
 
 
 async def _notify(
@@ -372,12 +422,13 @@ async def _notify(
     outcome: EstimationOutcome,
     rents: dict[int, RentEstimate],
     awaiting: set[int],
-    min_drop_percent: float,
     repository: OffersRepository,
+    watchlist: WatchlistRepository,
 ) -> None:
-    """Новые объявления уходят одним сообщением с оценкой, если она получена в этом проходе,
+    """Новые объявления уходят всем одним сообщением с оценкой, если она получена в этом проходе,
     иначе объявление запоминается в awaiting. Оценка, догнавшая такое объявление позже, уходит
-    отдельным сообщением; объявления, которых в Telegram не было, догоняющих сообщений не получают."""
+    отдельным сообщением; объявления, которых в Telegram не было, догоняющих сообщений не получают.
+    Изменения цены и возвращения уходят только наблюдателям."""
     new_ids = {offer.id for offer in report.new_offers}
     for offer in sorted(report.new_offers, key=lambda offer: offer.creation_date):
         estimate = outcome.estimates.get(offer.id, None)
@@ -395,9 +446,34 @@ async def _notify(
         if offer.id in awaiting and offer.id not in new_ids and offer.id in outcome.estimates:
             await notifier.notify_late_estimate(offer=offer, estimate=outcome.estimates[offer.id])
     awaiting.difference_update(outcome.estimates, outcome.not_found)
+    await _alert_watchers(
+        notifier=notifier, watchlist=watchlist, repository=repository, report=report, gone_ids=[]
+    )
+
+
+async def _alert_watchers(
+    notifier: TelegramNotifier,
+    watchlist: WatchlistRepository,
+    repository: OffersRepository,
+    report: PollReport,
+    gone_ids: list[int],
+) -> None:
+    """Алерты по объявлению только тем, кто нажал «Отслеживать»: любое изменение цены,
+    снятие с продажи, возвращение. Объявления без наблюдателей пропускаются молча."""
+    offer_ids = [change.offer.id for change in report.price_changes]
+    offer_ids += [offer.id for offer in report.reappeared]
+    offer_ids += gone_ids
+    watchers = await watchlist.watchers(offer_ids=offer_ids)
+    if not watchers:
+        return
     for change in report.price_changes:
-        if change.drop_percent() >= min_drop_percent:
-            await notifier.notify_price_change(change=change)
+        if change.offer.id in watchers:
+            await notifier.notify_price_change(change=change, chat_ids=watchers[change.offer.id])
+    for offer in report.reappeared:
+        if offer.id in watchers:
+            await notifier.notify_reappeared(offer=offer, chat_ids=watchers[offer.id])
+    for row in await repository.rows_by_ids(ids=[offer_id for offer_id in gone_ids if offer_id in watchers]):
+        await notifier.notify_gone(row=row, chat_ids=watchers[row.id])
 
 
 async def _estimate_pending(
@@ -481,8 +557,8 @@ def _print_report(report: PollReport, offers_total: int, quiet: bool) -> None:
 def _print_price_change(change: PriceChange) -> None:
     logger.info(
         "PRICE %s -> %s | %s | %s | %s",
-        _format_price(change.old_price),
-        _format_price(change.offer.price),
+        rubles(change.old_price),
+        rubles(change.offer.price),
         change.offer.formatted_full_info,
         change.offer.address,
         change.offer.url,
@@ -522,7 +598,7 @@ async def _estimate_rent(
         rents[offer.id] = rent
         logger.info(
             "RENT %s/month | %d similar, %s | payback %.0f years | %s",
-            _format_price(rent.median_rent),
+            rubles(rent.median_rent),
             rent.sample_size,
             rent.scope,
             offer.price / (rent.median_rent * 12),
@@ -535,18 +611,14 @@ def _print_estimate(offer: Offer, estimate: DomclickEstimate) -> None:
     gap_percent = (offer.price - estimate.market_price) / estimate.market_price * 100
     logger.info(
         "DOMCLICK %s (%s - %s) | cian %s, %+.0f%% to market | %s | %s",
-        _format_price(estimate.market_price),
-        _format_price(estimate.min_price),
-        _format_price(estimate.max_price),
-        _format_price(offer.price),
+        rubles(estimate.market_price),
+        rubles(estimate.min_price),
+        rubles(estimate.max_price),
+        rubles(offer.price),
         gap_percent,
         offer.url,
         estimate.url,
     )
-
-
-def _format_price(price: int) -> str:
-    return f"{price:,}".replace(",", " ") + " ₽"
 
 
 def _next_pause(settings: Settings) -> float:

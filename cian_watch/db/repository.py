@@ -20,11 +20,6 @@ class OffersRepository:
     def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
         self._sessions = sessions
 
-    async def is_empty(self) -> bool:
-        async with self._sessions() as session:
-            first = await session.execute(select(OfferRow.id).limit(1))
-            return first.first() is None
-
     async def record(
         self, offers: list[Offer], seen_at: datetime, deal_type: DealType = DealType.SALE
     ) -> PollReport:
@@ -71,6 +66,13 @@ class OffersRepository:
             if history:
                 await session.execute(insert(PriceHistoryRow), history)
         return report
+
+    async def rows_by_ids(self, ids: list[int]) -> list[OfferRow]:
+        if not ids:
+            return []
+        async with self._sessions() as session:
+            rows = await session.execute(select(OfferRow).where(OfferRow.id.in_(ids)))
+            return list(rows.scalars())
 
     async def known_ids(self, ids: list[int]) -> set[int]:
         async with self._sessions() as session:

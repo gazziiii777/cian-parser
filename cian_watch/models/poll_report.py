@@ -9,9 +9,6 @@ class PriceChange:
     offer: Offer
     old_price: int
 
-    def drop_percent(self) -> float:
-        return (self.old_price - self.offer.price) / self.old_price * 100
-
 
 @dataclass
 class PollReport:

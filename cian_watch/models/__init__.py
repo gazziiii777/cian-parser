@@ -8,6 +8,7 @@ from cian_watch.models.poll_report import EstimationOutcome, PollReport, PriceCh
 from cian_watch.models.rent import RentedStats, RentEstimate
 from cian_watch.models.search_api import PageFetchResult, SearchApiResponse
 from cian_watch.models.serp_config import InitialState, SerpConfigEntry
+from cian_watch.models.telegram import TelegramUpdate, TelegramUpdatesResponse
 
 __all__ = [
     "DomclickEstimate",
@@ -23,4 +24,6 @@ __all__ = [
     "RentedStats",
     "SearchApiResponse",
     "SerpConfigEntry",
+    "TelegramUpdate",
+    "TelegramUpdatesResponse",
 ]

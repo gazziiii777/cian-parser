@@ -2,42 +2,31 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from html import escape
-from types import TracebackType
-from typing import ClassVar, Self
+from http import HTTPStatus
+from typing import Any, ClassVar
 
 import httpx
 
+from cian_watch.db.tables import OfferRow
+from cian_watch.formatting import millions, rubles, short_address
 from cian_watch.models import DomclickEstimate, Offer, PriceChange, RentedStats, RentEstimate
+from cian_watch.telegram_api import TelegramApi
+from cian_watch.telegram_screens import Screens
 
 logger = logging.getLogger(__name__)
 
 
 class TelegramNotifier:
-    """Шлёт уведомления в один чат через Bot API. Любая ошибка отправки только логируется:
+    """Шлёт уведомления через Bot API. Новые объявления уходят всем активным пользователям,
+    алерты по объявлению только его наблюдателям. Любая ошибка отправки только логируется:
     уведомление вторично, цикл опроса и запись в базу важнее."""
 
-    API_URL: ClassVar[str] = "https://api.telegram.org/bot{token}/sendMessage"
-    REQUEST_TIMEOUT_SECONDS: ClassVar[float] = 15.0
     PAUSE_BETWEEN_MESSAGES_SECONDS: ClassVar[float] = 0.3
-    RUBLES_IN_MILLION: ClassVar[int] = 1_000_000
+    RETRY_AFTER_FALLBACK_SECONDS: ClassVar[float] = 5.0
 
-    def __init__(
-        self, bot_token: str, recipients: Callable[[], Awaitable[list[int]]], proxy: str | None
-    ) -> None:
-        self._url = self.API_URL.format(token=bot_token)
+    def __init__(self, api: TelegramApi, recipients: Callable[[], Awaitable[list[int]]]) -> None:
+        self._api = api
         self._recipients = recipients
-        self._client = httpx.AsyncClient(timeout=self.REQUEST_TIMEOUT_SECONDS, proxy=proxy)
-
-    async def __aenter__(self) -> Self:
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        await self._client.aclose()
 
     async def notify_new_offer(
         self,
@@ -62,11 +51,14 @@ class TelegramNotifier:
         if rented is not None:
             lines.append(
                 f"Сдано в районе {escape(rented.raion_name)} за {rented.days} дн.: {rented.count}, "
-                f"медиана {self._rubles(rented.median_rent)}/мес, "
+                f"медиана {rubles(rented.median_rent)}/мес, "
                 f"в среднем за {rented.median_exposure_days} дн."
             )
         lines.append(self._links(offer=offer, estimate=estimate))
-        await self._send("\n".join(lines))
+        await self._send_all(
+            text="\n".join(lines),
+            reply_markup=Screens.notification_markup(offer_id=offer.id, watching=False, hidden=False),
+        )
 
     async def notify_late_estimate(self, offer: Offer, estimate: DomclickEstimate) -> None:
         lines = [
@@ -75,23 +67,41 @@ class TelegramNotifier:
             self._estimate_line(offer=offer, estimate=estimate),
             self._links(offer=offer, estimate=estimate),
         ]
-        await self._send("\n".join(lines))
+        await self._send_all(text="\n".join(lines))
 
-    async def notify_price_change(self, change: PriceChange) -> None:
+    async def notify_price_change(self, change: PriceChange, chat_ids: list[int]) -> None:
         offer = change.offer
         percent = (offer.price - change.old_price) / change.old_price * 100
+        icon = "📉" if offer.price < change.old_price else "📈"
         lines = [
-            f"💰 {self._rubles(change.old_price)} → <b>{self._rubles(offer.price)}</b> ({percent:+.0f}%)"
+            f"{icon} {rubles(change.old_price)} → <b>{rubles(offer.price)}</b> ({percent:+.0f}%)"
             f" · {escape(offer.formatted_full_info)}",
             escape(offer.address),
             f'<a href="{offer.url}">Циан</a>',
         ]
-        await self._send("\n".join(lines))
+        await self._send_to_many(text="\n".join(lines), chat_ids=chat_ids)
+
+    async def notify_gone(self, row: OfferRow, chat_ids: list[int]) -> None:
+        lines = [
+            f"🚫 Снято с продажи: <b>{rubles(row.price)}</b> · {escape(row.info)}",
+            short_address(row.address),
+            f'<a href="{row.url}">Циан</a>',
+        ]
+        await self._send_to_many(text="\n".join(lines), chat_ids=chat_ids)
+
+    async def notify_reappeared(self, offer: Offer, chat_ids: list[int]) -> None:
+        lines = [
+            f"↩️ Снова в продаже: <b>{escape(offer.formatted_full_price)}</b>"
+            f" · {escape(offer.formatted_full_info)}",
+            escape(offer.address),
+            f'<a href="{offer.url}">Циан</a>',
+        ]
+        await self._send_to_many(text="\n".join(lines), chat_ids=chat_ids)
 
     def _rent_line(self, offer: Offer, rent: RentEstimate) -> str:
         payback_years = offer.price / (rent.median_rent * 12)
         return (
-            f"Аренда рядом: {self._rubles(rent.median_rent)}/мес, медиана по {rent.sample_size} похожим "
+            f"Аренда рядом: {rubles(rent.median_rent)}/мес, медиана по {rent.sample_size} похожим "
             f"({escape(rent.scope)}), окупаемость {payback_years:.0f} лет"
         )
 
@@ -106,36 +116,50 @@ class TelegramNotifier:
         gap = (offer.price - estimate.market_price) / estimate.market_price * 100
         verdict = f"выше рынка на {gap:.0f}%" if gap >= 0 else f"ниже рынка на {-gap:.0f}%"
         return (
-            f"Домклик: {self._rubles(estimate.market_price)} "
-            f"({self._millions(estimate.min_price)}–{self._millions(estimate.max_price)} млн), {verdict}"
+            f"Домклик: {rubles(estimate.market_price)} "
+            f"({millions(estimate.min_price)}–{millions(estimate.max_price)} млн), {verdict}"
         )
 
-    async def _send(self, text: str) -> None:
-        """Одно и то же сообщение всем активным пользователям; список берётся из базы при каждой
-        отправке, чтобы выданный доступ действовал без перезапуска."""
-        chat_ids = await self._recipients()
+    async def _send_all(self, text: str, reply_markup: dict[str, Any] | None = None) -> None:
+        """Список получателей берётся из базы при каждой отправке, чтобы выданный доступ
+        действовал без перезапуска."""
+        await self._send_to_many(text=text, chat_ids=await self._recipients(), reply_markup=reply_markup)
+
+    async def _send_to_many(
+        self, text: str, chat_ids: list[int], reply_markup: dict[str, Any] | None = None
+    ) -> None:
         for chat_id in chat_ids:
-            await self._send_to(chat_id=chat_id, text=text)
+            await self._send_to(chat_id=chat_id, text=text, reply_markup=reply_markup)
         logger.info("telegram message sent to %d users: %s", len(chat_ids), text.splitlines()[0])
 
-    async def _send_to(self, chat_id: int, text: str) -> None:
-        payload = {
+    async def _send_to(self, chat_id: int, text: str, reply_markup: dict[str, Any] | None) -> None:
+        payload: dict[str, Any] = {
             "chat_id": chat_id,
             "text": text,
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         try:
-            response = await self._client.post(self._url, json=payload)
-            response.raise_for_status()
+            await self._api.call(method="sendMessage", payload=payload)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != HTTPStatus.TOO_MANY_REQUESTS:
+                logger.warning("telegram message not sent to %d: %s", chat_id, exc.response.text)
+                return
+            await self._wait_rate_limit(response=exc.response, chat_id=chat_id)
+            await self._send_to(chat_id=chat_id, text=text, reply_markup=reply_markup)
+            return
         except httpx.HTTPError as exc:
             logger.warning("telegram message not sent to %d: %s", chat_id, exc)
             return
         await asyncio.sleep(self.PAUSE_BETWEEN_MESSAGES_SECONDS)
 
-    @staticmethod
-    def _rubles(price: int) -> str:
-        return f"{price:,}".replace(",", " ") + " ₽"
-
-    def _millions(self, price: int) -> str:
-        return f"{price / self.RUBLES_IN_MILLION:.1f}".replace(".", ",")
+    async def _wait_rate_limit(self, response: httpx.Response, chat_id: int) -> None:
+        """Telegram на 429 называет паузу в parameters.retry_after; ждём её и шлём заново один раз."""
+        try:
+            seconds = float(response.json()["parameters"]["retry_after"])
+        except (ValueError, KeyError, TypeError):
+            seconds = self.RETRY_AFTER_FALLBACK_SECONDS
+        logger.warning("telegram rate limit for %d, waiting %.0fs", chat_id, seconds)
+        await asyncio.sleep(seconds)

@@ -67,11 +67,6 @@ class Settings(BaseSettings):
         ge=1,
         description="Потолок страниц на район при обходе",
     )
-    price_drop_alert_percent: float = Field(
-        default=1.0,
-        ge=0,
-        description="Снижение цены меньше этого процента в Telegram не уходит, только в историю",
-    )
     sweep_misses_to_sell: int = Field(
         default=2,
         ge=1,
