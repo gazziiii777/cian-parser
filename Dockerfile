@@ -1,4 +1,4 @@
-FROM python:3.12-slim-bookworm AS builder
+FROM public.ecr.aws/docker/library/python:3.12-slim-bookworm AS builder
 
 ENV UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=1
@@ -22,7 +22,7 @@ COPY config ./config
 RUN uv sync --frozen --no-dev
 
 
-FROM python:3.12-slim-bookworm
+FROM public.ecr.aws/docker/library/python:3.12-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
     PATH=/app/.venv/bin:$PATH \
